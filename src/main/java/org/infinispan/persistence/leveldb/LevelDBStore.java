@@ -281,12 +281,17 @@ public class LevelDBStore implements AdvancedLoadWriteStore {
       ecs.submit(new Callable<Void>() {
          @Override
          public Void call() throws Exception {
+            long now = ctx.getTimeService().wallClockTime();
             for (Map.Entry<byte[], byte[]> entry : batch) {
-               if (taskContext.isStopped())
-                  break;
+               if (taskContext.isStopped()) {break;}
                Object key = unmarshall(entry.getKey());
-               if (filter == null || filter.shouldLoadKey(key))
-                  cacheLoaderTask.processEntry((MarshalledEntry) unmarshall(entry.getValue()), taskContext);
+               if (filter == null || filter.shouldLoadKey(key)) {
+                  MarshalledEntry unmarshall = (MarshalledEntry) unmarshall(entry.getValue());
+                  boolean isExpired = unmarshall.getMetadata() != null && unmarshall.getMetadata().isExpired(now);
+                  if (!isExpired) {
+                     cacheLoaderTask.processEntry(unmarshall, taskContext);
+                  }
+               }
             }
             return null;
          }
