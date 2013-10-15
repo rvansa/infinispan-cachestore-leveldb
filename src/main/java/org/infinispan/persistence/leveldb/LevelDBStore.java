@@ -2,13 +2,14 @@ package org.infinispan.persistence.leveldb;
 
 import org.infinispan.commons.CacheConfigurationException;
 import org.infinispan.commons.util.Util;
-import org.infinispan.persistence.leveldb.configuration.LevelDBStoreConfiguration;
-import org.infinispan.persistence.leveldb.logging.Log;
+import org.infinispan.executors.ExecutorAllCompletionService;
 import org.infinispan.marshall.core.MarshalledEntry;
 import org.infinispan.metadata.InternalMetadata;
 import org.infinispan.persistence.CacheLoaderException;
 import org.infinispan.persistence.PersistenceUtil;
 import org.infinispan.persistence.TaskContextImpl;
+import org.infinispan.persistence.leveldb.configuration.LevelDBStoreConfiguration;
+import org.infinispan.persistence.leveldb.logging.Log;
 import org.infinispan.persistence.spi.AdvancedLoadWriteStore;
 import org.infinispan.persistence.spi.InitializationContext;
 import org.infinispan.util.logging.LogFactory;
@@ -28,8 +29,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.Callable;
+import java.util.concurrent.CompletionService;
 import java.util.concurrent.Executor;
-import java.util.concurrent.ExecutorCompletionService;
 import java.util.concurrent.LinkedBlockingQueue;
 
 public class LevelDBStore implements AdvancedLoadWriteStore {
@@ -241,8 +242,7 @@ public class LevelDBStore implements AdvancedLoadWriteStore {
    public void process(KeyFilter keyFilter, CacheLoaderTask cacheLoaderTask, Executor executor, boolean loadValues, boolean loadMetadata) {
 
       int batchSize = 100;
-      ExecutorCompletionService ecs = new ExecutorCompletionService(executor);
-      int tasks = 0;
+      ExecutorAllCompletionService eacs = new ExecutorAllCompletionService(executor);
       final TaskContext taskContext = new TaskContextImpl();
 
       List<Map.Entry<byte[], byte[]>> entries = new ArrayList<Map.Entry<byte[], byte[]>>(batchSize);
@@ -254,16 +254,17 @@ public class LevelDBStore implements AdvancedLoadWriteStore {
             if (entries.size() == batchSize) {
                final List<Map.Entry<byte[], byte[]>> batch = entries;
                entries = new ArrayList<Map.Entry<byte[], byte[]>>(batchSize);
-               submitProcessTask(cacheLoaderTask, keyFilter,ecs, taskContext, batch);
-               tasks++;
+               submitProcessTask(cacheLoaderTask, keyFilter,eacs, taskContext, batch);
             }
          }
          if (!entries.isEmpty()) {
-            submitProcessTask(cacheLoaderTask, keyFilter,ecs, taskContext, entries);
-            tasks++;
+            submitProcessTask(cacheLoaderTask, keyFilter,eacs, taskContext, entries);
          }
 
-         PersistenceUtil.waitForAllTasksToComplete(ecs, tasks);
+         eacs.waitUntilAllCompleted();
+         if (eacs.isExceptionThrown()) {
+            throw new CacheLoaderException("Execution exception!", eacs.getFirstException());
+         }
       } catch (Exception e) {
          throw new CacheLoaderException(e);
       } finally {
@@ -276,22 +277,27 @@ public class LevelDBStore implements AdvancedLoadWriteStore {
    }
 
    @SuppressWarnings("unchecked")
-   private void submitProcessTask(final CacheLoaderTask cacheLoaderTask, final KeyFilter filter, ExecutorCompletionService ecs,
+   private void submitProcessTask(final CacheLoaderTask cacheLoaderTask, final KeyFilter filter, CompletionService ecs,
                                   final TaskContext taskContext, final List<Map.Entry<byte[], byte[]>> batch) {
       ecs.submit(new Callable<Void>() {
          @Override
          public Void call() throws Exception {
-            long now = ctx.getTimeService().wallClockTime();
-            for (Map.Entry<byte[], byte[]> entry : batch) {
-               if (taskContext.isStopped()) {break;}
-               Object key = unmarshall(entry.getKey());
-               if (filter == null || filter.shouldLoadKey(key)) {
-                  MarshalledEntry unmarshall = (MarshalledEntry) unmarshall(entry.getValue());
-                  boolean isExpired = unmarshall.getMetadata() != null && unmarshall.getMetadata().isExpired(now);
-                  if (!isExpired) {
-                     cacheLoaderTask.processEntry(unmarshall, taskContext);
+            try {
+               long now = ctx.getTimeService().wallClockTime();
+               for (Map.Entry<byte[], byte[]> entry : batch) {
+                  if (taskContext.isStopped()) {break;}
+                  Object key = unmarshall(entry.getKey());
+                  if (filter == null || filter.shouldLoadKey(key)) {
+                     MarshalledEntry unmarshall = (MarshalledEntry) unmarshall(entry.getValue());
+                     boolean isExpired = unmarshall.getMetadata() != null && unmarshall.getMetadata().isExpired(now);
+                     if (!isExpired) {
+                        cacheLoaderTask.processEntry(unmarshall, taskContext);
+                     }
                   }
                }
+            } catch (Exception e) {
+               log.errorExecutingParallelStoreTask(e);
+               throw e;
             }
             return null;
          }
